@@ -1,0 +1,115 @@
+# Native Samsung Galaxy S24 Ultra capture
+#
+# Boots a hardware-accelerated Android emulator, spoofs identity at the
+# Android property layer (not a Chrome user-agent flag), skips Chrome's
+# welcome / first-run screens, opens https://deviceinfo.me, and uploads
+# a screenshot.
+#
+# Use google_apis (userdebug), not google_apis_playstore. Play Store
+# images are production builds: `adb root` is refused and writing
+# /data/local.prop fails with Permission denied.
+#
+# Drop this file at .github/workflows/samsung-native-capture.yml together
+# with:
+#   scripts/emulator/patch-avd.sh
+#   scripts/emulator/spoof-and-capture.sh
+#
+# Run it from the Actions tab (workflow_dispatch).
+
+name: Samsung Chrome deviceinfo screenshot
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/samsung-native-capture.yml"
+      - "scripts/emulator/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: samsung-native-capture
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: Galaxy S24 Ultra · Chrome · deviceinfo.me
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Make emulator scripts executable
+        run: chmod +x scripts/emulator/*.sh
+
+      - name: Boot Samsung-spoofed emulator and capture
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          AVD_NAME: samsung-s24u
+        with:
+          api-level: 34
+          # userdebug: adb root + /data/local.prop work. playstore cannot root.
+          target: google_apis
+          arch: x86_64
+          avd-name: samsung-s24u
+          force-avd-creation: true
+          disable-animations: true
+          disable-spellchecker: true
+          cores: 4
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 8G
+          emulator-boot-timeout: 800
+          emulator-options: >-
+            -no-window
+            -gpu swiftshader_indirect
+            -no-snapshot
+            -noaudio
+            -no-boot-anim
+            -writable-system
+            -camera-back emulated
+            -camera-front emulated
+            -prop ro.product.brand=samsung
+            -prop ro.product.manufacturer=samsung
+            -prop ro.product.model=SM-S928B
+            -prop ro.product.name=e3sxxx
+            -prop ro.product.device=e3s
+            -prop ro.product.board=e3s
+            -prop ro.product.product.brand=samsung
+            -prop ro.product.product.manufacturer=samsung
+            -prop ro.product.product.model=SM-S928B
+            -prop ro.product.product.name=e3sxxx
+            -prop ro.product.product.device=e3s
+            -prop ro.product.system.model=SM-S928B
+            -prop ro.product.vendor.model=SM-S928B
+            -prop ro.build.product=e3s
+            -prop ro.build.characteristics=phone
+            -prop persist.sys.locale=en-US
+            -prop persist.sys.timezone=Europe/London
+          pre-emulator-launch-script: bash scripts/emulator/patch-avd.sh
+          script: bash scripts/emulator/spoof-and-capture.sh
+
+      - name: Upload screenshot and identity dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: samsung-s24u-deviceinfo
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
