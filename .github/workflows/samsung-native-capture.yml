@@ -2,45 +2,68 @@
 #
 # Boots a hardware-accelerated Android emulator, spoofs identity at the
 # Android property layer (not a Chrome user-agent flag), skips Chrome's
-# welcome / first-run screens, opens https://deviceinfo.me, and uploads
-# a screenshot.
+# welcome / first-run screens, searches Google for newscredo.com, opens
+# the site, smooth-scrolls and taps internal links with random dwell.
 #
-# Use google_apis (userdebug), not google_apis_playstore. Play Store
-# images are production builds: `adb root` is refused and writing
-# /data/local.prop fails with Permission denied.
+# Each run picks a random city in UK / USA / Australia / Canada
+# (locale, timezone, CSC country codes).
 #
-# Drop this file at .github/workflows/samsung-native-capture.yml together
-# with:
-#   scripts/emulator/patch-avd.sh
-#   scripts/emulator/spoof-and-capture.sh
+# Schedule: starts a chain once per day; each successful run immediately
+# dispatches the next until 5 runs complete in that 24h window.
 #
-# Run it from the Actions tab (workflow_dispatch).
-
-name: Samsung Chrome deviceinfo screenshot
+# Use google_apis (userdebug), not google_apis_playstore.
+name: Samsung Chrome newscredo capture
 
 on:
+  # Kick off the daily chain (UTC). Adjust hour if you prefer local time.
+  schedule:
+    - cron: "0 6 * * *"          # 06:00 UTC every day → starts chain run 1/5
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/samsung-native-capture.yml"
-      - "scripts/emulator/**"
+    inputs:
+      chain_index:
+        description: "Chain index within the daily batch (1–5). Leave 1 to start a full batch."
+        required: false
+        default: "1"
+        type: string
+  # Allow the job to re-trigger itself for chaining
+  workflow_call:
+    inputs:
+      chain_index:
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   contents: read
+  actions: write          # needed to dispatch the next chained run
 
 concurrency:
-  group: samsung-native-capture
-  cancel-in-progress: true
+  # Allow chained runs to queue; cancel only duplicate manual pushes
+  group: samsung-native-capture-${{ github.event.inputs.chain_index || '1' }}
+  cancel-in-progress: false
 
 jobs:
   capture:
-    name: Galaxy S24 Ultra · Chrome · deviceinfo.me
+    name: Galaxy S24 Ultra · run ${{ github.event.inputs.chain_index || '1' }}/5
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
+    timeout-minutes: 55
+    outputs:
+      chain_index: ${{ steps.chain.outputs.index }}
+      next_index: ${{ steps.chain.outputs.next }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve chain index
+        id: chain
+        run: |
+          IDX="${{ github.event.inputs.chain_index || '1' }}"
+          # clamp 1–5
+          if ! [[ "$IDX" =~ ^[1-5]$ ]]; then IDX=1; fi
+          NEXT=$((IDX + 1))
+          echo "index=$IDX"   >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"   >> "$GITHUB_OUTPUT"
+          echo "Chain index: $IDX / 5  (next would be $NEXT)"
 
       - name: Enable KVM
         run: |
@@ -62,6 +85,7 @@ jobs:
         uses: reactivecircus/android-emulator-runner@v2
         env:
           AVD_NAME: samsung-s24u
+          CHAIN_INDEX: ${{ steps.chain.outputs.index }}
         with:
           api-level: 34
           # userdebug: adb root + /data/local.prop work. playstore cannot root.
@@ -76,6 +100,8 @@ jobs:
           heap-size: 512M
           disk-size: 8G
           emulator-boot-timeout: 800
+          # Locale / timezone are set randomly inside spoof-and-capture.sh
+          # so we only pass the Samsung hardware identity here.
           emulator-options: >-
             -no-window
             -gpu swiftshader_indirect
@@ -100,8 +126,6 @@ jobs:
             -prop ro.product.vendor.model=SM-S928B
             -prop ro.build.product=e3s
             -prop ro.build.characteristics=phone
-            -prop persist.sys.locale=en-US
-            -prop persist.sys.timezone=Europe/London
           pre-emulator-launch-script: bash scripts/emulator/patch-avd.sh
           script: bash scripts/emulator/spoof-and-capture.sh
 
@@ -109,7 +133,24 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: samsung-s24u-deviceinfo
+          name: samsung-s24u-newscredo-run${{ steps.chain.outputs.index }}
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
+
+      # Instantly start the next run in the chain (1→2→3→4→5)
+      - name: Dispatch next chained run
+        if: success() && steps.chain.outputs.index < 5
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const next = '${{ steps.chain.outputs.next }}';
+            console.log(`Chain ${next}/5 — dispatching immediately…`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'samsung-native-capture.yml',
+              ref: context.ref.replace('refs/heads/', ''),
+              inputs: { chain_index: next }
+            });
+            console.log(`Dispatched chain run ${next}/5`);
