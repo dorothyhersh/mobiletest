@@ -13,7 +13,7 @@ ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
 
 CHROME_PKG="com.android.chrome"
-TARGET_URL="https://deviceinfo.me"
+TARGET_URL="https://newscredo.com"
 HAVE_ROOT=0
 
 log() { printf '[capture] %s\n' "$*"; }
