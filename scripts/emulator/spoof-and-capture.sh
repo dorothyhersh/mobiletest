@@ -16,8 +16,7 @@ mkdir -p "$ARTIFACTS"
 CHROME_PKG="com.android.chrome"
 TARGET_URL="https://www.google.com"
 SEARCH_URL="https://www.google.com/search?q=newscredo.com"
-RESULT_HOST="newscredo.com"   # result link to click: https://newscredo.com
-RESULT_TEXT="Newscredo"
+RESULT_HOST="https://newscredo.com"   # result link to click: https://newscredo.com
 HAVE_ROOT=0
 log() { printf '[capture] %s\n' "$*"; }
 adb_sh() {
