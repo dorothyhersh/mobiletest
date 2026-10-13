@@ -4,24 +4,23 @@
 #   2. Push Samsung identity to /data/local.prop and reboot so Chrome
 #      reads SM-S928B from Build.MODEL / client hints.
 #   3. Skip Chrome first-run / welcome / default-browser / sync
-#   4. Open https://deviceinfo.me in Chrome
-#   5. Screenshot to artifacts/
+#   4. Open https://www.google.com in Chrome
+#   5. Open the Google search for newscredo.com
+#   6. Smoothly scroll until "Newscredo - News" is on screen, then tap it
+#   7. Screenshots to artifacts/
 set -euo pipefail
-
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
-
 CHROME_PKG="com.android.chrome"
-TARGET_URL="https://newscredo.com"
+TARGET_URL="https://www.google.com"
+SEARCH_URL="https://www.google.com/search?q=newscredo.com"
+RESULT_TEXT="Newscredo - News"
 HAVE_ROOT=0
-
 log() { printf '[capture] %s\n' "$*"; }
-
 adb_sh() {
   adb shell "$@" | tr -d '\r'
 }
-
 wait_for_boot() {
   adb wait-for-device
   local i=0
@@ -38,13 +37,11 @@ wait_for_boot() {
   log "timed out waiting for boot"
   return 1
 }
-
 uid_is_root() {
   local uid
   uid="$(adb_sh id -u 2>/dev/null || true)"
   [[ "$uid" == "0" ]]
 }
-
 ensure_root() {
   local i out
   for i in 1 2 3 4 5 6; do
@@ -64,7 +61,6 @@ ensure_root() {
   log "no root — Play Store/user images block adbd. Identity will use emulator -prop only."
   return 1
 }
-
 samsung_prop_file() {
   cat <<'PROP'
 ro.product.brand=samsung
@@ -138,7 +134,6 @@ persist.sys.country=US
 persist.sys.timezone=Europe/London
 PROP
 }
-
 write_samsung_identity() {
   local tmp
   tmp="$(mktemp)"
@@ -149,14 +144,12 @@ write_samsung_identity() {
   log "pushed /data/local.prop"
   adb_sh ls -l /data/local.prop || true
 }
-
 apply_unprivileged_props() {
   adb shell setprop persist.sys.locale en-US >/dev/null 2>&1 || true
   adb shell setprop persist.sys.language en >/dev/null 2>&1 || true
   adb shell setprop persist.sys.country US >/dev/null 2>&1 || true
   adb shell setprop persist.sys.timezone Europe/London >/dev/null 2>&1 || true
 }
-
 dump_identity() {
   {
     echo "=== shell ==="
@@ -180,13 +173,11 @@ dump_identity() {
     adb_sh wm density || true
   } | tee "$ARTIFACTS/identity.txt"
 }
-
 skip_chrome_welcome() {
   local cmdline='chrome --disable-fre --no-first-run --no-default-browser-check --disable-search-engine-choice-screen --disable-features=TranslateUI,ChromeWhatsNew,PrivacySandboxSettings4,InterestFeedContentSuggestions'
   local tmp
   tmp="$(mktemp)"
   printf '%s\n' "$cmdline" > "$tmp"
-
   adb shell am set-debug-app --persistent "$CHROME_PKG" >/dev/null || true
   # /data/local/tmp is world-writable even without root.
   adb push "$tmp" /data/local/tmp/chrome-command-line >/dev/null
@@ -196,88 +187,54 @@ skip_chrome_welcome() {
     adb_sh chmod 644 /data/local/chrome-command-line || true
   fi
   rm -f "$tmp"
-
   adb shell pm grant "$CHROME_PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
   adb shell pm grant "$CHROME_PKG" android.permission.ACCESS_FINE_LOCATION >/dev/null 2>&1 || true
   adb shell pm grant "$CHROME_PKG" android.permission.ACCESS_COARSE_LOCATION >/dev/null 2>&1 || true
   adb shell pm grant "$CHROME_PKG" android.permission.CAMERA >/dev/null 2>&1 || true
   adb shell pm grant "$CHROME_PKG" android.permission.RECORD_AUDIO >/dev/null 2>&1 || true
-
   adb shell am force-stop "$CHROME_PKG" >/dev/null 2>&1 || true
   log "Chrome first-run flags written for ${CHROME_PKG}"
 }
-
+# Exact-match button text only (short needles like "ok" would also match
+# "cookie" or text inside search results).
 dismiss_chrome_sheets() {
   python3 - <<'PY'
 import re, subprocess, time
-
-NEEDLES = [
-    "use without an account",
-    "no thanks",
-    "don't allow",
-    "dont allow",
-    "not now",
-    "skip",
-    "got it",
-    "accept & continue",
-    "accept and continue",
-    "continue",
-    "ok",
-    "dismiss",
-    "never",
-    "no, thanks",
-]
-
+EXACT = {
+    "use without an account", "no thanks", "no, thanks", "don't allow",
+    "not now", "skip", "got it", "accept & continue", "accept and continue",
+    "no thanks, i'll stay signed out", "reject all", "accept all",
+    "i agree", "dismiss",
+}
 def dump():
-    subprocess.run(
-        ["adb", "shell", "uiautomator", "dump", "/sdcard/uidump.xml"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-    )
-    p = subprocess.run(
-        ["adb", "exec-out", "cat", "/sdcard/uidump.xml"],
-        capture_output=True, check=False,
-    )
-    return p.stdout.decode("utf-8", "replace")
-
+    subprocess.run(["adb","shell","uiautomator","dump","/sdcard/uidump.xml"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    p = subprocess.run(["adb","exec-out","cat","/sdcard/uidump.xml"],
+                       capture_output=True, check=False)
+    return p.stdout.decode("utf-8","replace")
 def nodes(xml):
-    out = []
     for m in re.finditer(r"<node\s+([^>]+)/?>", xml):
-        attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
-        bounds = attrs.get("bounds") or ""
-        mm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        a = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        mm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds",""))
         if not mm:
             continue
-        x1, y1, x2, y2 = map(int, mm.groups())
-        blob = " ".join(
-            [
-                attrs.get("text", ""),
-                attrs.get("content-desc", ""),
-                attrs.get("resource-id", ""),
-            ]
-        ).strip().lower()
-        out.append((blob, (x1 + x2) // 2, (y1 + y2) // 2))
-    return out
-
+        x1,y1,x2,y2 = map(int, mm.groups())
+        yield (a.get("text","").strip().lower(),
+               a.get("content-desc","").strip().lower(),
+               (x1+x2)//2, (y1+y2)//2)
 tapped = 0
-for _ in range(8):
-    xml = dump()
+for _ in range(6):
     found = False
-    for blob, x, y in nodes(xml):
-        if not blob:
-            continue
-        if any(n in blob for n in NEEDLES):
-            subprocess.run(["adb", "shell", "input", "tap", str(x), str(y)], check=False)
-            tapped += 1
-            found = True
-            time.sleep(1.2)
+    for text, desc, x, y in nodes(dump()):
+        if text in EXACT or desc in EXACT:
+            subprocess.run(["adb","shell","input","tap",str(x),str(y)], check=False)
+            tapped += 1; found = True; time.sleep(1.2)
             break
     if not found:
         break
-
-print(f"dismissed {tapped} chrome sheets", flush=True)
+print(f"dismissed {tapped} sheets", flush=True)
 PY
 }
-
 resolve_chrome() {
   local pkg
   for pkg in com.android.chrome com.chrome.beta com.chrome.dev org.chromium.chrome; do
@@ -291,39 +248,82 @@ resolve_chrome() {
   adb_sh pm list packages | tee "$ARTIFACTS/packages.txt" || true
   return 1
 }
-
-launch_chrome() {
+open_url() {
   adb shell am start \
     -p "$CHROME_PKG" \
     -a android.intent.action.VIEW \
     -c android.intent.category.BROWSABLE \
-    -d "$TARGET_URL" \
+    -d "$1" \
     -f 0x10000000 >/dev/null
-
-  log "launched ${CHROME_PKG} → ${TARGET_URL}"
+  log "opened $1"
 }
-
 wait_for_page() {
-  local i=0
-  while (( i < 40 )); do
-    if adb_sh dumpsys activity activities 2>/dev/null | grep -qi "deviceinfo"; then
-      log "deviceinfo activity visible"
-      sleep 10
-      return 0
-    fi
-    sleep 1
-    i=$((i + 1))
-  done
-  log "did not observe deviceinfo in activity dump; waiting anyway"
-  sleep 12
+  sleep "${1:-6}"
 }
+# Scroll smoothly until the result text is visible, then tap it.
+tap_search_result() {
+  RESULT_TEXT="$RESULT_TEXT" MAX_SCROLLS="${MAX_SCROLLS:-40}" python3 - <<'PY'
+import os, re, subprocess, sys, time
 
+TARGET = os.environ["RESULT_TEXT"].strip().lower()
+MAX_SCROLLS = int(os.environ["MAX_SCROLLS"])
+
+def sh(*args):
+    return subprocess.run(["adb", *args], capture_output=True, check=False)
+
+def size():
+    out = sh("shell", "wm", "size").stdout.decode()
+    m = re.findall(r"(\d+)x(\d+)", out)
+    return tuple(map(int, m[-1])) if m else (1080, 2340)
+
+W, H = size()
+TOP_SAFE, BOTTOM_SAFE = int(H * 0.18), int(H * 0.90)   # avoid URL bar / nav bar
+
+def dump():
+    sh("shell", "uiautomator", "dump", "/sdcard/uidump.xml")
+    return sh("exec-out", "cat", "/sdcard/uidump.xml").stdout.decode("utf-8", "replace")
+
+def find(xml):
+    for m in re.finditer(r"<node\s+([^>]+)/?>", xml):
+        a = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        if "url_bar" in a.get("resource-id", ""):
+            continue
+        blob = (a.get("text", "") + " " + a.get("content-desc", "")).lower()
+        if TARGET not in blob:
+            continue
+        mm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds", ""))
+        if not mm:
+            continue
+        x1, y1, x2, y2 = map(int, mm.groups())
+        if x2 - x1 <= 0 or y2 - y1 <= 0:
+            continue
+        yield (x1 + x2) // 2, (y1 + y2) // 2
+
+def smooth_scroll():
+    x = W // 2
+    # slow, moderate-length swipe (700 ms) so it reads as a gentle scroll
+    sh("shell", "input", "swipe", str(x), str(int(H * 0.72)),
+       str(x), str(int(H * 0.42)), "700")
+    time.sleep(1.0)
+
+for attempt in range(MAX_SCROLLS + 1):
+    hit = next((p for p in find(dump()) if TOP_SAFE < p[1] < BOTTOM_SAFE), None)
+    if hit:
+        sh("shell", "input", "tap", str(hit[0]), str(hit[1]))
+        print(f"tapped '{TARGET}' at {hit} after {attempt} scrolls", flush=True)
+        sys.exit(0)
+    print(f"not on screen (attempt {attempt}), scrolling...", flush=True)
+    smooth_scroll()
+
+print("result not found", flush=True)
+sys.exit(1)
+PY
+}
 screenshot() {
   local name="$1"
   adb exec-out screencap -p > "${ARTIFACTS}/${name}"
   log "wrote ${ARTIFACTS}/${name} ($(wc -c < "${ARTIFACTS}/${name}") bytes)"
 }
-
 settle_device() {
   adb shell svc power stayon true >/dev/null || true
   adb shell settings put global stay_on_while_plugged_in 3 >/dev/null || true
@@ -333,19 +333,15 @@ settle_device() {
   adb_sh wm size 1080x2340 || true
   adb_sh wm density 420 || true
 }
-
 # --- main ---
 log "waiting for first boot"
 wait_for_boot
-
 if ensure_root; then
   HAVE_ROOT=1
 fi
-
 settle_device
 apply_unprivileged_props
 dump_identity
-
 if [[ "$HAVE_ROOT" == "1" ]]; then
   write_samsung_identity
   log "rebooting so identity props load before Chrome"
@@ -362,18 +358,31 @@ if [[ "$HAVE_ROOT" == "1" ]]; then
 else
   log "skipping /data/local.prop (no root). Boot-time emulator -prop still applied."
 fi
-
 resolve_chrome
 skip_chrome_welcome
-launch_chrome
-sleep 3
+
+# 1) open google.com first
+open_url "$TARGET_URL"
+wait_for_page 5
 dismiss_chrome_sheets
-launch_chrome
-wait_for_page
+screenshot "01-google-home.png"
+
+# 2) go to the search results (same as typing it in the address bar)
+open_url "$SEARCH_URL"
+wait_for_page 6
 dismiss_chrome_sheets
-screenshot "deviceinfo-samsung.png"
-sleep 6
-screenshot "deviceinfo-samsung-late.png"
+screenshot "02-search-results.png"
+
+# 3) scroll smoothly until "Newscredo - News" is found, then tap it
+if tap_search_result; then
+  wait_for_page 10
+  screenshot "03-newscredo-opened.png"
+  sleep 6
+  screenshot "04-newscredo-late.png"
+else
+  log "could not find '${RESULT_TEXT}' in results"
+  screenshot "03-not-found.png"
+fi
 
 log "done"
 ls -la "$ARTIFACTS"
