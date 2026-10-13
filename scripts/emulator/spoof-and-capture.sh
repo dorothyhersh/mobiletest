@@ -17,9 +17,9 @@ ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
 CHROME_PKG="com.android.chrome"
 TARGET_URL="https://www.google.com"
-SEARCH_URL="https://www.google.com/search?q=newscredo.com"
-RESULT_HOST="newscredo.com"   # result link to click: https://newscredo.com
-RESULT_TEXT="Newscredo"
+SEARCH_URL="https://www.google.com/search?q=gardengar.com"
+RESULT_HOST="gardengar.com"   # result link to click: https://newscredo.com
+RESULT_TEXT="Gardengar"
 HAVE_ROOT=0
 log() { printf '[capture] %s\n' "$*"; }
 
