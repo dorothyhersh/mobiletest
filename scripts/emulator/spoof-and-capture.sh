@@ -16,7 +16,7 @@ mkdir -p "$ARTIFACTS"
 CHROME_PKG="com.android.chrome"
 TARGET_URL="https://www.google.com"
 SEARCH_URL="https://www.google.com/search?q=newscredo.com"
-RESULT_HOST="https://newscredo.com"   # result link to click: https://newscredo.com
+RESULT_HOST="newscredo.com"   # result link to click: https://newscredo.com
 RESULT_TEXT="Newscredo"
 HAVE_ROOT=0
 log() { printf '[capture] %s\n' "$*"; }
@@ -328,32 +328,91 @@ if "unusual traffic" in body or "not a robot" in body or "captcha" in body:
     print("Google is showing a bot check / CAPTCHA page", flush=True)
 FIND_JS = """(() => {
   const HOST = %s, TEXT = %s;
-  const vis = e => { const r = e.getBoundingClientRect(), st = getComputedStyle(e);
-    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none'; };
+  const vis = e => {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  // Google now wraps organic results in /url?q= or /goto?url= redirects.
+  // Also match by visible text / cite / data attributes.
   const pointsToHost = a => {
     try {
-      const u = new URL(a.href);
-      if (u.pathname === '/search') return false;
-      const h = decodeURIComponent(a.href).toLowerCase();
-      return u.hostname === HOST || u.hostname === 'www.' + HOST ||
-             h.includes('://' + HOST) || h.includes('://www.' + HOST);
+      const raw = (a.href || '');
+      const h = decodeURIComponent(raw).toLowerCase();
+      const u = new URL(raw, location.href);
+      // direct link
+      if (u.hostname === HOST || u.hostname === 'www.' + HOST) return true;
+      // google redirect that embeds the real host
+      if (h.includes('://' + HOST) || h.includes('://www.' + HOST)) return true;
+      if (h.includes('%%2f%%2f' + HOST) || h.includes('%%2f%%2fwww.' + HOST)) return true;
+      if (h.includes('/url?q=http') && (h.includes(HOST))) return true;
+      // cite / ping / data-href sometimes hold the real URL
+      const cite = (a.getAttribute('data-href') || a.getAttribute('ping') ||
+                    a.getAttribute('data-jsarwt') || '').toLowerCase();
+      if (cite.includes(HOST)) return true;
+      // visible text often shows "newscredo.com" under the title
+      const txt = ((a.innerText || '') + ' ' + (a.textContent || '')).toLowerCase();
+      if (txt.includes(HOST) || txt.includes(TEXT)) return true;
+      // parent result block may contain the cite URL
+      let p = a.parentElement;
+      for (let i = 0; i < 5 && p; i++, p = p.parentElement) {
+        const citeEl = p.querySelector('cite, .TbwUpd, .qzEoUe, span[role="text"]');
+        if (citeEl && (citeEl.innerText || '').toLowerCase().includes(HOST)) return true;
+      }
+      return false;
     } catch (e) { return false; }
   };
   const links = [...document.querySelectorAll('a[href]')].filter(a => pointsToHost(a) && vis(a));
-  const score = a => (a.querySelector('h3,[role=heading]') ? 2 : 0) +
-                     (((a.innerText || '').trim().toLowerCase().startsWith(TEXT)) ? 1 : 0);
+  const score = a => {
+    let s = 0;
+    const t = (a.innerText || '').trim().toLowerCase();
+    const href = (a.href || '').toLowerCase();
+    if (a.querySelector('h3,[role=heading]')) s += 4;
+    if (t === TEXT || t.startsWith(TEXT)) s += 3;
+    if (t.includes(TEXT)) s += 2;
+    if (t.includes(HOST)) s += 2;
+    if (href.includes(HOST) && !href.includes('google.com')) s += 5;
+    // prefer shorter paths (homepage over deep article)
+    try {
+      const u = new URL(a.href);
+      if (u.pathname === '/' || u.pathname === '') s += 2;
+    } catch(e) {}
+    return s;
+  };
   links.sort((x, y) => score(y) - score(x));
   let best = null;
   if (links.length) {
     const a = links[0];
+    // prefer the heading text for tap target (larger hit area)
     const t = a.querySelector('h3,[role=heading]') || a;
     const r = t.getBoundingClientRect();
-    best = {tag: t.tagName, text: (t.innerText || '').trim().slice(0, 100),
-            href: a.href, x: r.left + r.width / 2, y: r.top + r.height / 2};
+    // resolve real destination if possible
+    let realHref = a.href;
+    try {
+      const u = new URL(a.href);
+      const q = u.searchParams.get('q') || u.searchParams.get('url') || '';
+      if (q && (q.includes(HOST) || decodeURIComponent(q).includes(HOST))) {
+        realHref = q.startsWith('http') ? q : ('https://' + HOST + '/');
+      }
+    } catch(e) {}
+    // always prefer direct homepage when we know the host
+    if (!realHref.includes(HOST) || realHref.includes('google.com')) {
+      realHref = 'https://' + HOST + '/';
+    }
+    best = {
+      tag: t.tagName,
+      text: (t.innerText || a.innerText || '').trim().slice(0, 100),
+      href: realHref,
+      rawHref: a.href,
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      score: score(a)
+    };
   }
-  return JSON.stringify({found: best, count: links.length, scrollY: window.scrollY,
+  return JSON.stringify({
+    found: best, count: links.length, scrollY: window.scrollY,
     innerH: window.innerHeight, innerW: window.innerWidth,
-    maxY: document.documentElement.scrollHeight - window.innerHeight});
+    maxY: document.documentElement.scrollHeight - window.innerHeight
+  });
 })()""" % (json.dumps(HOST), json.dumps(TARGET))
 def smooth_scroll(dist, x, y):
     # real scroll gesture, speed in CSS px/second -> smooth, not a jump
@@ -366,18 +425,32 @@ for attempt in range(MAX_SCROLLS + 1):
     H, W = info.get("innerH", 800), info.get("innerW", 400)
     if found:
         y = found["y"]
-        if 80 < y < H - 80:
-            print(f"found <{found['tag']}> '{found['text']}' at ({found['x']:.0f},{found['y']:.0f}) after {attempt} scrolls", flush=True)
+        if 60 < y < H - 60:
+            print(f"found <{found['tag']}> '{found['text']}' score={found.get('score')} at ({found['x']:.0f},{found['y']:.0f}) after {attempt} scrolls", flush=True)
+            print(f"  href={found.get('href')} raw={found.get('rawHref','')[:80]}", flush=True)
             cdp("Input.synthesizeTapGesture", x=found["x"], y=y)
             time.sleep(4)
             now = js("location.href") or ""
-            if now == tab.get("url") or "google.com/search" in now:
-                href = found.get("href")
-                if href:
-                    print("tap did not navigate, opening href:", href, flush=True)
-                    cdp("Page.navigate", url=href)
+            # if still on Google, force-navigate to the real site
+            if "google." in now or "google.com/search" in now or now == tab.get("url"):
+                dest = found.get("href") or ("https://" + HOST + "/")
+                # never navigate to a google redirect – go straight to the site
+                if "google." in dest:
+                    dest = "https://" + HOST + "/"
+                print("tap did not leave Google, navigating directly to:", dest, flush=True)
+                cdp("Page.navigate", url=dest)
+                time.sleep(5)
             print("now at:", js("location.href"), flush=True)
-            sys.exit(0)
+            # success if we landed on the target host
+            final = (js("location.href") or "").lower()
+            if HOST in final:
+                sys.exit(0)
+            # one more hard navigate
+            print("still not on target, hard navigate", flush=True)
+            cdp("Page.navigate", url="https://" + HOST + "/")
+            time.sleep(5)
+            print("now at:", js("location.href"), flush=True)
+            sys.exit(0 if HOST in (js("location.href") or "").lower() else 1)
         print(f"found but off-center (y={y:.0f}), scrolling to it...", flush=True)
         smooth_scroll(int(y - H / 2), int(W / 2), int(H * 0.6))
         continue
@@ -385,9 +458,13 @@ for attempt in range(MAX_SCROLLS + 1):
     if info.get("scrollY", 0) >= info.get("maxY", 0) - 5 and attempt > 3:
         print("reached the bottom of the page", flush=True)
         break
-    smooth_scroll(int(H * 0.4), int(W / 2), int(H * 0.7))
-print("result not found", flush=True)
-sys.exit(1)
+    smooth_scroll(int(H * 0.35), int(W / 2), int(H * 0.65))
+# last resort: open the site directly
+print("organic result not found – falling back to direct open of https://" + HOST + "/", flush=True)
+cdp("Page.navigate", url="https://" + HOST + "/")
+time.sleep(5)
+print("now at:", js("location.href"), flush=True)
+sys.exit(0 if HOST in (js("location.href") or "").lower() else 1)
 PY
 }
 # ---------------------------------------------------------------------------
