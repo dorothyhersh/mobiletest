@@ -3,11 +3,13 @@
 #   1. Root adbd (google_apis = userdebug). Play Store images cannot root.
 #   2. Push Samsung identity to /data/local.prop and reboot so Chrome
 #      reads SM-S928B from Build.MODEL / client hints.
-#   3. Skip Chrome first-run / welcome / default-browser / sync
-#   4. Open https://www.google.com in Chrome
-#   5. Open the Google search for newscredo.com
-#   6. Via Chrome DevTools: find the result link to https://newscredo.com, scroll smoothly, tap it
-#   7. On newscredo.com: smooth-scroll, randomly dwell 70-120s, tap internal links
+#   3. Randomly pick country + city from UK / USA / Australia / Canada
+#      (locale, timezone, CSC codes) — different every run.
+#   4. Skip Chrome first-run / welcome / default-browser / sync
+#   5. Open https://www.google.com in Chrome
+#   6. Open the Google search for newscredo.com
+#   7. Via Chrome DevTools: find the result link to https://newscredo.com, scroll smoothly, tap it
+#   8. On newscredo.com: smooth-scroll, randomly dwell 70-120s, tap internal links
 #      (articles / categories), repeat browse cycle 2 times, screenshots to artifacts/
 set -euo pipefail
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -20,6 +22,56 @@ RESULT_HOST="newscredo.com"   # result link to click: https://newscredo.com
 RESULT_TEXT="Newscredo"
 HAVE_ROOT=0
 log() { printf '[capture] %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Random geo identity — UK / USA / Australia / Canada
+# Each workflow run gets a different city (locale, timezone, CSC).
+# ---------------------------------------------------------------------------
+pick_random_location() {
+  # Format: COUNTRY|CITY|LOCALE|LANGUAGE|COUNTRY_ISO|TIMEZONE|CSC_SALES|CSC_COUNTRY
+  local PROFILES=(
+    # United Kingdom
+    "UK|London|en-GB|en|GB|Europe/London|BTU|GB"
+    "UK|Manchester|en-GB|en|GB|Europe/London|BTU|GB"
+    "UK|Birmingham|en-GB|en|GB|Europe/London|BTU|GB"
+    "UK|Edinburgh|en-GB|en|GB|Europe/London|BTU|GB"
+    "UK|Glasgow|en-GB|en|GB|Europe/London|BTU|GB"
+    # United States
+    "USA|New York|en-US|en|US|America/New_York|XAA|US"
+    "USA|Los Angeles|en-US|en|US|America/Los_Angeles|XAA|US"
+    "USA|Chicago|en-US|en|US|America/Chicago|XAA|US"
+    "USA|Houston|en-US|en|US|America/Chicago|XAA|US"
+    "USA|Miami|en-US|en|US|America/New_York|XAA|US"
+    "USA|Seattle|en-US|en|US|America/Los_Angeles|XAA|US"
+    # Australia
+    "Australia|Sydney|en-AU|en|AU|Australia/Sydney|XSA|AU"
+    "Australia|Melbourne|en-AU|en|AU|Australia/Melbourne|XSA|AU"
+    "Australia|Brisbane|en-AU|en|AU|Australia/Brisbane|XSA|AU"
+    "Australia|Perth|en-AU|en|AU|Australia/Perth|XSA|AU"
+    # Canada
+    "Canada|Toronto|en-CA|en|CA|America/Toronto|BMC|CA"
+    "Canada|Vancouver|en-CA|en|CA|America/Vancouver|BMC|CA"
+    "Canada|Montreal|en-CA|en|CA|America/Toronto|BMC|CA"
+    "Canada|Calgary|en-CA|en|CA|America/Edmonton|BMC|CA"
+  )
+  local pick="${PROFILES[RANDOM % ${#PROFILES[@]}]}"
+  IFS='|' read -r GEO_COUNTRY GEO_CITY GEO_LOCALE GEO_LANG GEO_ISO GEO_TZ GEO_CSC_SALES GEO_CSC_COUNTRY <<< "$pick"
+  export GEO_COUNTRY GEO_CITY GEO_LOCALE GEO_LANG GEO_ISO GEO_TZ GEO_CSC_SALES GEO_CSC_COUNTRY
+  log "geo → ${GEO_COUNTRY} / ${GEO_CITY}  locale=${GEO_LOCALE} tz=${GEO_TZ} csc=${GEO_CSC_SALES}/${GEO_CSC_COUNTRY}"
+  {
+    echo "country=${GEO_COUNTRY}"
+    echo "city=${GEO_CITY}"
+    echo "locale=${GEO_LOCALE}"
+    echo "language=${GEO_LANG}"
+    echo "iso=${GEO_ISO}"
+    echo "timezone=${GEO_TZ}"
+    echo "csc_sales=${GEO_CSC_SALES}"
+    echo "csc_country=${GEO_CSC_COUNTRY}"
+    echo "chain_index=${CHAIN_INDEX:-1}"
+  } > "${ARTIFACTS}/geo.txt"
+}
+pick_random_location
+
 adb_sh() {
   adb shell "$@" | tr -d '\r'
 }
@@ -64,7 +116,8 @@ ensure_root() {
   return 1
 }
 samsung_prop_file() {
-  cat <<'PROP'
+  # Unquoted heredoc so GEO_* variables expand; no other $ in the body.
+  cat <<PROP
 ro.product.brand=samsung
 ro.product.manufacturer=samsung
 ro.product.model=SM-S928B
@@ -125,15 +178,15 @@ ro.odm.build.fingerprint=samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:use
 ro.product.build.fingerprint=samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys
 ro.system_ext.build.fingerprint=samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys
 ro.boot.em.model=SM-S928B
-ro.csc.sales_code=EUX
-ro.csc.country_code=GB
-ro.csc.countryiso_code=GB
+ro.csc.sales_code=${GEO_CSC_SALES}
+ro.csc.country_code=${GEO_CSC_COUNTRY}
+ro.csc.countryiso_code=${GEO_ISO}
 ro.product.first_api_level=34
 ro.sf.lcd_density=420
-persist.sys.locale=en-US
-persist.sys.language=en
-persist.sys.country=US
-persist.sys.timezone=Europe/London
+persist.sys.locale=${GEO_LOCALE}
+persist.sys.language=${GEO_LANG}
+persist.sys.country=${GEO_ISO}
+persist.sys.timezone=${GEO_TZ}
 PROP
 }
 write_samsung_identity() {
@@ -143,14 +196,15 @@ write_samsung_identity() {
   adb push "$tmp" /data/local.prop
   adb_sh chmod 644 /data/local.prop
   rm -f "$tmp"
-  log "pushed /data/local.prop"
+  log "pushed /data/local.prop (geo=${GEO_COUNTRY}/${GEO_CITY})"
   adb_sh ls -l /data/local.prop || true
 }
 apply_unprivileged_props() {
-  adb shell setprop persist.sys.locale en-US >/dev/null 2>&1 || true
-  adb shell setprop persist.sys.language en >/dev/null 2>&1 || true
-  adb shell setprop persist.sys.country US >/dev/null 2>&1 || true
-  adb shell setprop persist.sys.timezone Europe/London >/dev/null 2>&1 || true
+  adb shell setprop persist.sys.locale "${GEO_LOCALE}" >/dev/null 2>&1 || true
+  adb shell setprop persist.sys.language "${GEO_LANG}" >/dev/null 2>&1 || true
+  adb shell setprop persist.sys.country "${GEO_ISO}" >/dev/null 2>&1 || true
+  adb shell setprop persist.sys.timezone "${GEO_TZ}" >/dev/null 2>&1 || true
+  log "applied locale=${GEO_LOCALE} tz=${GEO_TZ} country=${GEO_ISO}"
 }
 dump_identity() {
   {
@@ -160,13 +214,19 @@ dump_identity() {
     echo "ro.build.type=$(adb_sh getprop ro.build.type)"
     echo
     echo "=== identity ==="
+    echo "=== geo (chosen this run) ==="
+    echo "country=${GEO_COUNTRY} city=${GEO_CITY}"
+    echo "locale=${GEO_LOCALE} tz=${GEO_TZ} iso=${GEO_ISO}"
+    echo "csc_sales=${GEO_CSC_SALES} csc_country=${GEO_CSC_COUNTRY}"
+    echo
     for key in \
       ro.product.brand ro.product.manufacturer ro.product.model \
       ro.product.name ro.product.device ro.product.marketname \
       ro.product.product.model ro.build.fingerprint \
       ro.build.version.release ro.build.version.sdk \
       ro.build.characteristics ro.hardware ro.kernel.qemu \
-      persist.sys.locale persist.sys.timezone; do
+      persist.sys.locale persist.sys.timezone \
+      ro.csc.sales_code ro.csc.country_code ro.csc.countryiso_code; do
       printf '%s=%s\n' "$key" "$(adb_sh getprop "$key")"
     done
     echo
