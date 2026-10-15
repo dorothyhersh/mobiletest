@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Real organic mobile traffic simulator for gardengar.com
-# - Opens Google search
-# - Performs a real touch tap on the organic result (keeps Google referrer)
-# - Browses 2-5 internal pages with human-like scroll + dwell
-# - No forced country / timezone / locale (uses real runner IP)
-# - Screenshots saved to artifacts/
+# Real organic mobile traffic for gardengar.com
+# - Real touch tap on Google result (including AI Overview links)
+# - Detects new tab / delayed navigation correctly
+# - 2–5 page engagement
+# - No forced country / timezone
 set -euo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -67,7 +66,6 @@ ensure_root() {
   return 1
 }
 
-# Lightweight Samsung identity (model only). No country / timezone / locale forcing.
 samsung_prop_file() {
   cat <<'PROP'
 ro.product.brand=samsung
@@ -156,8 +154,7 @@ def nodes(xml):
     for m in re.finditer(r"<node\s+([^>]+)/?>", xml):
         a = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
         mm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds",""))
-        if not mm:
-            continue
+        if not mm: continue
         x1,y1,x2,y2 = map(int, mm.groups())
         yield (a.get("text","").strip().lower(),
                a.get("content-desc","").strip().lower(),
@@ -170,8 +167,7 @@ for _ in range(6):
             subprocess.run(["adb","shell","input","tap",str(x),str(y)], check=False)
             tapped += 1; found = True; time.sleep(1.2)
             break
-    if not found:
-        break
+    if not found: break
 print(f"dismissed {tapped} sheets", flush=True)
 PY
 }
@@ -200,19 +196,17 @@ open_url() {
   log "opened $1"
 }
 
-wait_for_page() {
-  sleep "${1:-6}"
-}
+wait_for_page() { sleep "${1:-6}"; }
 
 # ---------------------------------------------------------------------------
-# REAL organic click from Google SERP
+# REAL organic click – handles AI Overview + new tabs
 # ---------------------------------------------------------------------------
 tap_search_result() {
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
     || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
   adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
 
-  RESULT_HOST="$RESULT_HOST" RESULT_TEXT="$RESULT_TEXT" ARTIFACTS="$ARTIFACTS" MAX_SCROLLS="${MAX_SCROLLS:-50}" python3 - <<'PY'
+  RESULT_HOST="$RESULT_HOST" RESULT_TEXT="$RESULT_TEXT" ARTIFACTS="$ARTIFACTS" MAX_SCROLLS="${MAX_SCROLLS:-45}" python3 - <<'PY'
 import json, os, sys, time, urllib.request
 import websocket
 
@@ -225,16 +219,25 @@ def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
         return json.loads(r.read().decode())
 
-tab = None
-for _ in range(40):
+def find_best_tab():
+    """Return the page tab that is most likely the one we want (prefer target host)."""
     try:
         pages = [t for t in get_tabs() if t.get("type") == "page"]
-        pages.sort(key=lambda t: 0 if "google." in t.get("url", "") else 1)
-        if pages:
-            tab = pages[0]
-            break
     except Exception:
-        pass
+        return None
+    # Prefer any tab already on the target
+    for t in pages:
+        if HOST in t.get("url", "").lower() and "google." not in t.get("url", "").lower():
+            return t
+    # Otherwise prefer Google search tabs
+    pages.sort(key=lambda t: 0 if "google." in t.get("url", "") else 1)
+    return pages[0] if pages else None
+
+tab = None
+for _ in range(40):
+    tab = find_best_tab()
+    if tab:
+        break
     time.sleep(1)
 
 if not tab:
@@ -263,25 +266,45 @@ def cdp(method, **params):
             if msg.get("id") == _id:
                 return msg.get("result", {})
         except Exception as e:
-            print(f"cdp recv error: {e}", flush=True)
-            time.sleep(0.5)
+            print(f"cdp recv: {e}", flush=True)
+            time.sleep(0.4)
     raise TimeoutError(f"CDP timeout for {method}")
 
 def js(expr):
     r = cdp("Runtime.evaluate", expression=expr, returnByValue=True)
     return r.get("result", {}).get("value")
 
-# Enable necessary domains
 cdp("Page.enable")
 cdp("Runtime.enable")
 cdp("Network.enable")
+
+# Optional: click "Search only for gardengar" if Google shows the correction banner
+def try_exact_query():
+    clicked = js("""(() => {
+      const links = [...document.querySelectorAll('a')];
+      for (const a of links) {
+        const t = (a.innerText || '').trim().toLowerCase();
+        if (t.includes('search only for') && t.includes('gardengar')) {
+          a.click();
+          return true;
+        }
+      }
+      return false;
+    })()""")
+    if clicked:
+        print("clicked 'Search only for gardengar'", flush=True)
+        time.sleep(3.5)
+        return True
+    return False
+
+try_exact_query()
 
 # Debug dump
 DEBUG_JS = """(() => JSON.stringify({
   url: location.href, title: document.title,
   headings: [...document.querySelectorAll('h3,[role=heading]')]
-      .map(e => (e.innerText||'').trim()).filter(Boolean).slice(0,30),
-  body: (document.body.innerText||'').slice(0,1200)
+      .map(e => (e.innerText||'').trim()).filter(Boolean).slice(0,25),
+  body: (document.body.innerText||'').slice(0,1000)
 }))()"""
 dbg = js(DEBUG_JS)
 with open(os.path.join(ARTIFACTS, "page-debug.json"), "w") as f:
@@ -290,15 +313,11 @@ d = json.loads(dbg or "{}")
 print("page title:", d.get("title"), flush=True)
 print("headings:", d.get("headings"), flush=True)
 
-body = (d.get("body") or "").lower()
-if "unusual traffic" in body or "not a robot" in body or "captcha" in body:
-    print("WARNING: Google bot check / CAPTCHA detected", flush=True)
-
 FIND_JS = """(() => {
   const HOST = %s, TEXT = %s;
   const vis = e => {
     const r = e.getBoundingClientRect(), st = getComputedStyle(e);
-    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+    return r.width > 4 && r.height > 4 && st.visibility !== 'hidden' && st.display !== 'none';
   };
   const pointsToHost = a => {
     try {
@@ -308,14 +327,13 @@ FIND_JS = """(() => {
       if (u.hostname === HOST || u.hostname === 'www.' + HOST || u.hostname === 'm.' + HOST) return true;
       if (h.includes('://' + HOST) || h.includes('://www.' + HOST) || h.includes('://m.' + HOST)) return true;
       if (h.includes('%%2f%%2f' + HOST) || h.includes('%%2f%%2fwww.' + HOST)) return true;
-      if (h.includes('/url?q=') && h.includes(HOST)) return true;
-      if (h.includes('/goto?url=') && h.includes(HOST)) return true;
+      if ((h.includes('/url?q=') || h.includes('/goto?url=')) && h.includes(HOST)) return true;
       const cite = (a.getAttribute('data-href') || a.getAttribute('ping') || '').toLowerCase();
       if (cite.includes(HOST)) return true;
       const txt = ((a.innerText || '') + ' ' + (a.textContent || '')).toLowerCase();
-      if (txt.includes(HOST) || txt.includes(TEXT)) return true;
+      if (txt.includes(HOST) || (txt.includes(TEXT) && txt.length < 80)) return true;
       let p = a.parentElement;
-      for (let i = 0; i < 6 && p; i++, p = p.parentElement) {
+      for (let i = 0; i < 7 && p; i++, p = p.parentElement) {
         const citeEl = p.querySelector('cite, .TbwUpd, .qzEoUe, span[role="text"]');
         if (citeEl && (citeEl.innerText || '').toLowerCase().includes(HOST)) return true;
       }
@@ -327,10 +345,14 @@ FIND_JS = """(() => {
     let s = 0;
     const t = (a.innerText || '').trim().toLowerCase();
     const href = (a.href || '').toLowerCase();
-    if (a.querySelector('h3,[role=heading]')) s += 5;
-    if (t.includes(TEXT) || t.includes(HOST)) s += 3;
-    if (href.includes(HOST) && !href.includes('google.com')) s += 4;
+    // Prefer classic organic title links
+    if (a.querySelector('h3,[role=heading]')) s += 8;
+    if (t === HOST || t === 'www.' + HOST || t === TEXT) s += 6;
+    if (t.includes(HOST)) s += 4;
+    if (href.includes(HOST) && !href.includes('google.com')) s += 5;
     if (href.includes('/url?q=') || href.includes('/goto?url=')) s += 3;
+    // Slight penalty for pure AI Overview text links (still usable)
+    if (!a.querySelector('h3,[role=heading]') && t.length > 40) s -= 1;
     try {
       const u = new URL(a.href);
       if (u.pathname === '/' || u.pathname === '') s += 2;
@@ -365,11 +387,23 @@ def smooth_scroll(dist, x, y):
         x=x, y=y, yDistance=-dist, speed=480, gestureSourceType="touch")
     time.sleep(1.1)
 
-def is_on_target():
-    url = (js("location.href") or "").lower()
-    return HOST in url and "google." not in url and "chrome-error" not in url
+def is_target_url(url):
+    u = (url or "").lower()
+    return HOST in u and "google." not in u and "chrome-error" not in u
 
-# Main search loop
+def check_any_tab_on_target():
+    """Look at ALL open tabs – this is the key fix for new-tab / AI Overview behaviour."""
+    try:
+        for t in get_tabs():
+            if t.get("type") != "page":
+                continue
+            if is_target_url(t.get("url", "")):
+                return t
+    except Exception as e:
+        print(f"tab scan error: {e}", flush=True)
+    return None
+
+# Main search + tap loop
 for attempt in range(MAX_SCROLLS + 1):
     info = json.loads(js(FIND_JS) or "{}")
     found = info.get("found")
@@ -378,67 +412,70 @@ for attempt in range(MAX_SCROLLS + 1):
 
     if found:
         y = found["y"]
-        if 80 < y < H - 80:
+        if 70 < y < H - 70:
             print(f"found <{found['tag']}> '{found['text']}' score={found.get('score')} "
                   f"at ({found['x']:.0f},{found['y']:.0f}) after {attempt} scrolls", flush=True)
-            print(f"  href={found['href'][:100]}", flush=True)
+            print(f"  href={found['href'][:110]}", flush=True)
 
-            # Real human-like tap (this is what creates organic attribution)
+            # Real human-like tap
             cdp("Input.synthesizeTapGesture", x=found["x"], y=y)
-            print("real tap performed – waiting for Google redirect...", flush=True)
+            print("real tap performed – waiting for navigation / new tab...", flush=True)
 
-            # Wait for navigation (Google click-tracking → site)
-            for wait in range(18):
-                time.sleep(1.2)
-                now = (js("location.href") or "").lower()
-                print(f"  [{wait+1}] now at: {now[:90]}", flush=True)
+            # Wait and poll ALL tabs (critical fix)
+            for wait in range(22):
+                time.sleep(1.3)
 
-                if "chrome-error" in now:
-                    print("chrome-error detected, retrying tap once...", flush=True)
-                    time.sleep(2)
-                    cdp("Input.synthesizeTapGesture", x=found["x"], y=y)
-                    time.sleep(4)
-                    continue
+                # 1. Check if current tab navigated
+                try:
+                    now = (js("location.href") or "").lower()
+                    print(f"  [{wait+1}] current tab: {now[:95]}", flush=True)
+                    if is_target_url(now):
+                        print("SUCCESS: current tab is on target (organic)", flush=True)
+                        ws.close()
+                        sys.exit(0)
+                except Exception:
+                    pass
 
-                if is_on_target():
-                    print("SUCCESS: landed on target via real organic click", flush=True)
+                # 2. Check if a NEW tab opened on the target
+                target_tab = check_any_tab_on_target()
+                if target_tab:
+                    print(f"SUCCESS: found target in another tab → {target_tab.get('url')}", flush=True)
+                    # Switch our WebSocket to the new tab so later browse works
+                    try:
+                        ws.close()
+                    except: pass
+                    ws = websocket.create_connection(
+                        target_tab["webSocketDebuggerUrl"],
+                        timeout=90, suppress_origin=True,
+                        ping_interval=15, ping_timeout=10
+                    )
+                    print("switched WebSocket to target tab", flush=True)
                     ws.close()
                     sys.exit(0)
 
-                # Still on Google redirect page is OK – keep waiting
-                if "google.com/url" in now or "google.com/goto" in now or "/url?q=" in now:
-                    continue
-
-            # Final check
-            if is_on_target():
-                print("SUCCESS after extended wait", flush=True)
-                ws.close()
-                sys.exit(0)
-
-            print("tap did not result in landing on target after retries", flush=True)
-            # Do NOT hard-navigate – that would create direct traffic
+            print("tap did not land on target after full wait", flush=True)
+            # Do NOT hard-navigate
             ws.close()
             sys.exit(1)
 
-        # Found but off-screen → scroll it into view
         print(f"found but off-center (y={y:.0f}), scrolling into view...", flush=True)
-        smooth_scroll(int(y - H / 2), int(W / 2), int(H * 0.6))
+        smooth_scroll(int(y - H / 2), int(W / 2), int(H * 0.58))
         continue
 
     print(f"not found yet (attempt {attempt}, scrollY={info.get('scrollY')}/{info.get('maxY')})", flush=True)
-    if info.get("scrollY", 0) >= info.get("maxY", 0) - 10 and attempt > 4:
+    if info.get("scrollY", 0) >= info.get("maxY", 0) - 10 and attempt > 5:
         print("reached bottom of SERP", flush=True)
         break
-    smooth_scroll(int(H * 0.38), int(W / 2), int(H * 0.65))
+    smooth_scroll(int(H * 0.36), int(W / 2), int(H * 0.62))
 
-print("organic result not found or tap failed – refusing to hard-navigate (would be direct traffic)", flush=True)
+print("organic result not found – refusing hard navigation", flush=True)
 ws.close()
 sys.exit(1)
 PY
 }
 
 # ---------------------------------------------------------------------------
-# Realistic multi-page engagement (2–5 pages)
+# Multi-page engagement (2–5 pages)
 # ---------------------------------------------------------------------------
 browse_site() {
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
@@ -451,18 +488,16 @@ import websocket
 
 ARTIFACTS = os.environ["ARTIFACTS"]
 HOST = os.environ["RESULT_HOST"].strip().lower()
-
-# Random number of pages: 2–5 (including the landing page)
 NUM_PAGES = random.randint(2, 5)
 MIN_DWELL = 28
-MAX_DWELL = 75
+MAX_DWELL = 72
 
 def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
         return json.loads(r.read().decode())
 
 tab = None
-for _ in range(40):
+for _ in range(45):
     try:
         pages = [t for t in get_tabs() if t.get("type") == "page"]
         pages.sort(key=lambda t: 0 if HOST in t.get("url", "").lower() else 1)
@@ -481,10 +516,8 @@ print("browse attached to:", tab.get("url"), flush=True)
 
 ws = websocket.create_connection(
     tab["webSocketDebuggerUrl"],
-    timeout=90,
-    suppress_origin=True,
-    ping_interval=15,
-    ping_timeout=10
+    timeout=90, suppress_origin=True,
+    ping_interval=15, ping_timeout=10
 )
 
 _id = 0
@@ -500,17 +533,13 @@ def cdp(method, **params):
                 if msg.get("id") == _id:
                     return msg.get("result", {})
         except Exception as e:
-            print(f"CDP error (attempt {attempt+1}): {e}", flush=True)
-            try:
-                ws.close()
+            print(f"CDP error ({attempt+1}): {e}", flush=True)
+            try: ws.close()
             except: pass
             time.sleep(1.5)
-            # reconnect
-            tabs = get_tabs()
-            pages = [t for t in tabs if t.get("type") == "page"]
-            if not pages:
-                raise
-            tab = pages[0]
+            tabs = [t for t in get_tabs() if t.get("type") == "page"]
+            if not tabs: raise
+            tab = tabs[0]
             ws = websocket.create_connection(
                 tab["webSocketDebuggerUrl"], timeout=90,
                 suppress_origin=True, ping_interval=15, ping_timeout=10
@@ -536,32 +565,25 @@ def smooth_scroll_random(total_time_sec):
     scroll_count = 0
     while time.time() < end:
         d = page_dims()
-        H = d.get("H", 800)
-        W = d.get("W", 400)
-        maxY = d.get("maxY", 0)
-        curY = d.get("scrollY", 0)
-
+        H, W = d.get("H", 800), d.get("W", 400)
+        maxY, curY = d.get("maxY", 0), d.get("scrollY", 0)
         if curY >= maxY - 30 and maxY > 0:
             direction = 1
         elif curY < 40:
             direction = -1
         else:
             direction = -1 if random.random() < 0.78 else 1
-
-        dist = random.randint(int(H * 0.22), int(H * 0.52))
-        speed = random.randint(260, 620)
+        dist = random.randint(int(H * 0.22), int(H * 0.50))
+        speed = random.randint(260, 600)
         x = int(W * random.uniform(0.32, 0.68))
-        y = int(H * random.uniform(0.42, 0.72))
-
+        y = int(H * random.uniform(0.42, 0.70))
         cdp("Input.synthesizeScrollGesture",
             x=x, y=y, yDistance=direction * dist,
             speed=speed, gestureSourceType="touch")
         scroll_count += 1
-
-        pause = random.uniform(1.6, 4.2)
+        pause = random.uniform(1.5, 4.0)
         remaining = end - time.time()
-        if remaining <= 0:
-            break
+        if remaining <= 0: break
         time.sleep(min(pause, remaining))
     print(f"  performed {scroll_count} smooth scrolls over ~{total_time_sec}s", flush=True)
 
@@ -571,8 +593,7 @@ def find_internal_links():
         const vis = e => {
             const r = e.getBoundingClientRect(), st = getComputedStyle(e);
             return r.width > 10 && r.height > 10 && st.visibility !== 'hidden'
-                   && st.display !== 'none' && r.top < window.innerHeight
-                   && r.bottom > 0;
+                   && st.display !== 'none' && r.top < window.innerHeight && r.bottom > 0;
         };
         const isInternal = a => {
             try {
@@ -598,7 +619,7 @@ def find_internal_links():
         const links = [...document.querySelectorAll('a[href]')]
             .filter(a => isInternal(a) && vis(a));
         links.sort((x,y) => score(y) - score(x));
-        return JSON.stringify(links.slice(0, 20).map(a => {
+        return JSON.stringify(links.slice(0, 18).map(a => {
             const t = a.querySelector('h1,h2,h3,h4,[role=heading]') || a;
             const r = t.getBoundingClientRect();
             return {
@@ -610,10 +631,8 @@ def find_internal_links():
             };
         }));
     })()""")
-    try:
-        return json.loads(raw or "[]")
-    except Exception:
-        return []
+    try: return json.loads(raw or "[]")
+    except: return []
 
 def tap_link(link):
     x, y = link["x"], link["y"]
@@ -626,8 +645,7 @@ def tap_link(link):
             x=int(d.get("W", 400)/2), y=int(H*0.55),
             yDistance=-dist, speed=420, gestureSourceType="touch")
         time.sleep(1.3)
-        links = find_internal_links()
-        for L in links:
+        for L in find_internal_links():
             if L["href"] == link["href"]:
                 x, y = L["x"], L["y"]
                 break
@@ -638,16 +656,14 @@ def tap_link(link):
     if now.rstrip("/") == link["href"].rstrip("/"):
         print(f"  navigated OK → {now}", flush=True)
         return True
-    # Soft fallback only for internal links (already on-site)
-    print(f"  tap may have missed, soft navigate to {link['href']}", flush=True)
+    print(f"  soft navigate to {link['href']}", flush=True)
     cdp("Page.navigate", url=link["href"])
     time.sleep(3.5)
     return True
 
-# ---------- main engagement loop ----------
 visited = set()
 current = js("location.href") or ""
-print(f"starting engagement browse on: {current}", flush=True)
+print(f"starting engagement on: {current}", flush=True)
 print(f"will visit {NUM_PAGES} pages total", flush=True)
 
 for page_num in range(1, NUM_PAGES + 1):
@@ -656,7 +672,6 @@ for page_num in range(1, NUM_PAGES + 1):
     print(f"  dwelling ~{dwell}s with smooth scrolls...", flush=True)
     smooth_scroll_random(dwell)
 
-    # Screenshot
     try:
         import subprocess
         name = f"0{4 + page_num}-page{page_num}.png"
@@ -669,24 +684,21 @@ for page_num in range(1, NUM_PAGES + 1):
     if page_num >= NUM_PAGES:
         break
 
-    # Pick next internal page
     links = find_internal_links()
     candidates = [L for L in links if L["href"] not in visited and L.get("score", 0) >= 1]
     if not candidates:
         candidates = [L for L in links if L["href"] not in visited]
     if not candidates:
-        print("  no more internal links, stopping early", flush=True)
+        print("  no more internal links", flush=True)
         break
 
-    top = candidates[:7]
-    choice = random.choice(top)
+    choice = random.choice(candidates[:7])
     visited.add(choice["href"])
     tap_link(choice)
     time.sleep(2)
     print(f"  now at: {js('location.href')}", flush=True)
 
-# Final short dwell
-final_dwell = random.randint(18, 40)
+final_dwell = random.randint(18, 38)
 print(f"\n===== FINAL DWELL ~{final_dwell}s =====", flush=True)
 smooth_scroll_random(final_dwell)
 
@@ -695,11 +707,10 @@ try:
     subprocess.run(["adb", "exec-out", "screencap", "-p"],
                    stdout=open(os.path.join(ARTIFACTS, "09-final.png"), "wb"), check=False)
     print("  screenshot 09-final.png", flush=True)
-except Exception:
-    pass
+except: pass
 
 print("\nbrowse finished")
-print("visited pages:", list(visited), flush=True)
+print("visited:", list(visited), flush=True)
 ws.close()
 PY
 }
@@ -736,11 +747,7 @@ if [[ "$HAVE_ROOT" == "1" ]]; then
   log "rebooting so identity props load"
   adb reboot
   wait_for_boot
-  if ensure_root; then
-    HAVE_ROOT=1
-  else
-    HAVE_ROOT=0
-  fi
+  if ensure_root; then HAVE_ROOT=1; else HAVE_ROOT=0; fi
   settle_device
   dump_identity
 else
@@ -750,24 +757,21 @@ fi
 resolve_chrome
 skip_chrome_welcome
 
-# 1) Google homepage
 open_url "$TARGET_URL"
 wait_for_page 5
 dismiss_chrome_sheets
 screenshot "01-google-home.png"
 
-# 2) Search results
 open_url "$SEARCH_URL"
 wait_for_page 7
 dismiss_chrome_sheets
 screenshot "02-search-results.png"
 
-# 3) REAL organic click (no hard-navigate fallback)
-log "attempting real organic click from Google SERP..."
+log "attempting real organic click from Google SERP (handles AI Overview + new tabs)..."
 if tap_search_result; then
-  wait_for_page 8
+  wait_for_page 6
   screenshot "03-organic-landed.png"
-  sleep 4
+  sleep 3
   screenshot "04-organic-settled.png"
 
   log "starting multi-page engagement (2-5 pages)"
@@ -779,5 +783,5 @@ else
   exit 1
 fi
 
-log "done – check artifacts/ for screenshots and identity.txt"
+log "done"
 ls -la "$ARTIFACTS"
