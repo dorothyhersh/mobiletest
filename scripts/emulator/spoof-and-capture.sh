@@ -4,6 +4,7 @@
 # - Detects new tab / delayed navigation correctly
 # - 2–5 page engagement
 # - No forced country / timezone
+# - More resilient Chrome + DevTools handling
 set -euo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -186,7 +187,10 @@ resolve_chrome() {
   return 1
 }
 
+# More reliable open + wait for Chrome to be ready
 open_url() {
+  adb shell am force-stop "$CHROME_PKG" >/dev/null 2>&1 || true
+  sleep 1
   adb shell am start \
     -p "$CHROME_PKG" \
     -a android.intent.action.VIEW \
@@ -194,9 +198,38 @@ open_url() {
     -d "$1" \
     -f 0x10000000 >/dev/null
   log "opened $1"
+  sleep 4
 }
 
 wait_for_page() { sleep "${1:-6}"; }
+
+# Robust DevTools readiness check
+wait_for_devtools() {
+  local max_attempts="${1:-25}"
+  local i=0
+  adb forward --remove tcp:9222 >/dev/null 2>&1 || true
+  adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
+
+  while (( i < max_attempts )); do
+    if curl -s --max-time 3 http://127.0.0.1:9222/json >/dev/null 2>&1; then
+      local count
+      count=$(curl -s --max-time 3 http://127.0.0.1:9222/json 2>/dev/null | python3 -c "import sys,json; print(len([t for t in json.load(sys.stdin) if t.get('type')=='page']))" 2>/dev/null || echo 0)
+      if [[ "$count" -gt 0 ]]; then
+        log "DevTools ready (${count} page tab(s))"
+        return 0
+      fi
+    fi
+    sleep 1.5
+    i=$((i + 1))
+    # Re-forward every few attempts
+    if (( i % 5 == 0 )); then
+      adb forward --remove tcp:9222 >/dev/null 2>&1 || true
+      adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
+    fi
+  done
+  log "DevTools not ready after ${max_attempts} attempts"
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # REAL organic click – handles AI Overview + new tabs
@@ -204,7 +237,19 @@ wait_for_page() { sleep "${1:-6}"; }
 tap_search_result() {
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
     || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
-  adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
+
+  # Make sure DevTools is alive
+  if ! wait_for_devtools 30; then
+    log "DevTools still not available – trying one Chrome restart"
+    adb shell am force-stop "$CHROME_PKG" >/dev/null 2>&1 || true
+    sleep 2
+    open_url "$SEARCH_URL"
+    wait_for_page 8
+    if ! wait_for_devtools 20; then
+      echo "DevTools tab not reachable" >&2
+      return 1
+    fi
+  fi
 
   RESULT_HOST="$RESULT_HOST" RESULT_TEXT="$RESULT_TEXT" ARTIFACTS="$ARTIFACTS" MAX_SCROLLS="${MAX_SCROLLS:-45}" python3 - <<'PY'
 import json, os, sys, time, urllib.request
@@ -220,25 +265,22 @@ def get_tabs():
         return json.loads(r.read().decode())
 
 def find_best_tab():
-    """Return the page tab that is most likely the one we want (prefer target host)."""
     try:
         pages = [t for t in get_tabs() if t.get("type") == "page"]
     except Exception:
         return None
-    # Prefer any tab already on the target
     for t in pages:
         if HOST in t.get("url", "").lower() and "google." not in t.get("url", "").lower():
             return t
-    # Otherwise prefer Google search tabs
     pages.sort(key=lambda t: 0 if "google." in t.get("url", "") else 1)
     return pages[0] if pages else None
 
 tab = None
-for _ in range(40):
+for _ in range(45):
     tab = find_best_tab()
     if tab:
         break
-    time.sleep(1)
+    time.sleep(1.2)
 
 if not tab:
     print("DevTools tab not reachable", flush=True)
@@ -248,10 +290,10 @@ print("attached to:", tab.get("url"), flush=True)
 
 ws = websocket.create_connection(
     tab["webSocketDebuggerUrl"],
-    timeout=90,
+    timeout=100,
     suppress_origin=True,
-    ping_interval=15,
-    ping_timeout=10
+    ping_interval=12,
+    ping_timeout=8
 )
 
 _id = 0
@@ -259,7 +301,7 @@ def cdp(method, **params):
     global _id
     _id += 1
     ws.send(json.dumps({"id": _id, "method": method, "params": params}))
-    deadline = time.time() + 25
+    deadline = time.time() + 28
     while time.time() < deadline:
         try:
             msg = json.loads(ws.recv())
@@ -267,7 +309,7 @@ def cdp(method, **params):
                 return msg.get("result", {})
         except Exception as e:
             print(f"cdp recv: {e}", flush=True)
-            time.sleep(0.4)
+            time.sleep(0.5)
     raise TimeoutError(f"CDP timeout for {method}")
 
 def js(expr):
@@ -278,7 +320,6 @@ cdp("Page.enable")
 cdp("Runtime.enable")
 cdp("Network.enable")
 
-# Optional: click "Search only for gardengar" if Google shows the correction banner
 def try_exact_query():
     clicked = js("""(() => {
       const links = [...document.querySelectorAll('a')];
@@ -299,7 +340,6 @@ def try_exact_query():
 
 try_exact_query()
 
-# Debug dump
 DEBUG_JS = """(() => JSON.stringify({
   url: location.href, title: document.title,
   headings: [...document.querySelectorAll('h3,[role=heading]')]
@@ -345,13 +385,11 @@ FIND_JS = """(() => {
     let s = 0;
     const t = (a.innerText || '').trim().toLowerCase();
     const href = (a.href || '').toLowerCase();
-    // Prefer classic organic title links
     if (a.querySelector('h3,[role=heading]')) s += 8;
     if (t === HOST || t === 'www.' + HOST || t === TEXT) s += 6;
     if (t.includes(HOST)) s += 4;
     if (href.includes(HOST) && !href.includes('google.com')) s += 5;
     if (href.includes('/url?q=') || href.includes('/goto?url=')) s += 3;
-    // Slight penalty for pure AI Overview text links (still usable)
     if (!a.querySelector('h3,[role=heading]') && t.length > 40) s -= 1;
     try {
       const u = new URL(a.href);
@@ -392,7 +430,6 @@ def is_target_url(url):
     return HOST in u and "google." not in u and "chrome-error" not in u
 
 def check_any_tab_on_target():
-    """Look at ALL open tabs – this is the key fix for new-tab / AI Overview behaviour."""
     try:
         for t in get_tabs():
             if t.get("type") != "page":
@@ -403,7 +440,6 @@ def check_any_tab_on_target():
         print(f"tab scan error: {e}", flush=True)
     return None
 
-# Main search + tap loop
 for attempt in range(MAX_SCROLLS + 1):
     info = json.loads(js(FIND_JS) or "{}")
     found = info.get("found")
@@ -417,15 +453,11 @@ for attempt in range(MAX_SCROLLS + 1):
                   f"at ({found['x']:.0f},{found['y']:.0f}) after {attempt} scrolls", flush=True)
             print(f"  href={found['href'][:110]}", flush=True)
 
-            # Real human-like tap
             cdp("Input.synthesizeTapGesture", x=found["x"], y=y)
             print("real tap performed – waiting for navigation / new tab...", flush=True)
 
-            # Wait and poll ALL tabs (critical fix)
-            for wait in range(22):
+            for wait in range(24):
                 time.sleep(1.3)
-
-                # 1. Check if current tab navigated
                 try:
                     now = (js("location.href") or "").lower()
                     print(f"  [{wait+1}] current tab: {now[:95]}", flush=True)
@@ -436,25 +468,16 @@ for attempt in range(MAX_SCROLLS + 1):
                 except Exception:
                     pass
 
-                # 2. Check if a NEW tab opened on the target
                 target_tab = check_any_tab_on_target()
                 if target_tab:
                     print(f"SUCCESS: found target in another tab → {target_tab.get('url')}", flush=True)
-                    # Switch our WebSocket to the new tab so later browse works
                     try:
                         ws.close()
                     except: pass
-                    ws = websocket.create_connection(
-                        target_tab["webSocketDebuggerUrl"],
-                        timeout=90, suppress_origin=True,
-                        ping_interval=15, ping_timeout=10
-                    )
-                    print("switched WebSocket to target tab", flush=True)
-                    ws.close()
+                    print("switched to target tab", flush=True)
                     sys.exit(0)
 
             print("tap did not land on target after full wait", flush=True)
-            # Do NOT hard-navigate
             ws.close()
             sys.exit(1)
 
@@ -475,15 +498,15 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# Multi-page engagement (2–5 pages) – STRICT target-tab selection
+# Multi-page engagement (2–5 pages)
 # ---------------------------------------------------------------------------
 browse_site() {
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
     || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
-  adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
 
-  # Give Chrome a moment after the organic tab switch
-  sleep 3
+  adb forward --remove tcp:9222 >/dev/null 2>&1 || true
+  adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
+  sleep 4
 
   ARTIFACTS="$ARTIFACTS" RESULT_HOST="$RESULT_HOST" python3 - <<'PY'
 import json, os, sys, time, random, urllib.request
@@ -493,37 +516,33 @@ ARTIFACTS = os.environ["ARTIFACTS"]
 HOST = os.environ["RESULT_HOST"].strip().lower()
 NUM_PAGES = random.randint(2, 5)
 MIN_DWELL = 28
-MAX_DWELL = 72
+MAX_DWELL = 70
 
 def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
         return json.loads(r.read().decode())
 
-def find_target_tab(max_attempts=30):
-    """Strictly find a tab that is already on the target host."""
+def find_target_tab(max_attempts=35):
     for attempt in range(max_attempts):
         try:
             pages = [t for t in get_tabs() if t.get("type") == "page"]
-            # Prefer exact host match and exclude Google
             candidates = []
             for t in pages:
                 url = t.get("url", "").lower()
                 if HOST in url and "google." not in url and "chrome-error" not in url:
                     candidates.append(t)
             if candidates:
-                # Prefer the one that looks most like the homepage or main site
                 candidates.sort(key=lambda t: 0 if t.get("url", "").rstrip("/").endswith(HOST) else 1)
                 return candidates[0]
         except Exception as e:
             print(f"tab lookup error: {e}", flush=True)
-        time.sleep(1.2)
+        time.sleep(1.3)
     return None
 
 print("looking for target tab (gardengar.com)...", flush=True)
 tab = find_target_tab()
 if not tab:
     print("ERROR: could not find any tab on", HOST, flush=True)
-    # Debug: show all open tabs
     try:
         for t in get_tabs():
             if t.get("type") == "page":
@@ -555,12 +574,10 @@ def cdp(method, **params):
                     return msg.get("result", {})
         except Exception as e:
             print(f"CDP error ({attempt+1}): {e}", flush=True)
-            try:
-                ws.close()
+            try: ws.close()
             except: pass
             time.sleep(2)
-            # Re-find the target tab and reconnect
-            new_tab = find_target_tab(max_attempts=8)
+            new_tab = find_target_tab(max_attempts=10)
             if not new_tab:
                 print("lost target tab during reconnect", flush=True)
                 raise
@@ -568,10 +585,8 @@ def cdp(method, **params):
             print(f"reconnected to: {tab.get('url')}", flush=True)
             ws = websocket.create_connection(
                 tab["webSocketDebuggerUrl"],
-                timeout=120,
-                suppress_origin=True,
-                ping_interval=12,
-                ping_timeout=8
+                timeout=120, suppress_origin=True,
+                ping_interval=12, ping_timeout=8
             )
     raise RuntimeError("CDP failed after retries")
 
@@ -598,28 +613,23 @@ def smooth_scroll_random(total_time_sec):
         W = d.get("W", 400)
         maxY = d.get("maxY", 0)
         curY = d.get("scrollY", 0)
-
         if curY >= maxY - 30 and maxY > 0:
             direction = 1
         elif curY < 40:
             direction = -1
         else:
             direction = -1 if random.random() < 0.78 else 1
-
         dist = random.randint(int(H * 0.22), int(H * 0.50))
         speed = random.randint(260, 600)
         x = int(W * random.uniform(0.32, 0.68))
         y = int(H * random.uniform(0.42, 0.70))
-
         cdp("Input.synthesizeScrollGesture",
             x=x, y=y, yDistance=direction * dist,
             speed=speed, gestureSourceType="touch")
         scroll_count += 1
-
         pause = random.uniform(1.5, 4.0)
         remaining = end - time.time()
-        if remaining <= 0:
-            break
+        if remaining <= 0: break
         time.sleep(min(pause, remaining))
     print(f"  performed {scroll_count} smooth scrolls over ~{total_time_sec}s", flush=True)
 
@@ -667,10 +677,8 @@ def find_internal_links():
             };
         }));
     })()""")
-    try:
-        return json.loads(raw or "[]")
-    except Exception:
-        return []
+    try: return json.loads(raw or "[]")
+    except: return []
 
 def tap_link(link):
     x, y = link["x"], link["y"]
@@ -694,13 +702,11 @@ def tap_link(link):
     if now.rstrip("/") == link["href"].rstrip("/"):
         print(f"  navigated OK → {now}", flush=True)
         return True
-    # Soft fallback only for internal pages (already on-site)
     print(f"  soft navigate to {link['href']}", flush=True)
     cdp("Page.navigate", url=link["href"])
     time.sleep(3.5)
     return True
 
-# ---------- main engagement ----------
 visited = set()
 current = js("location.href") or ""
 print(f"starting engagement on: {current}", flush=True)
@@ -800,19 +806,30 @@ fi
 resolve_chrome
 skip_chrome_welcome
 
+# 1) Google home
 open_url "$TARGET_URL"
-wait_for_page 5
+wait_for_page 6
 dismiss_chrome_sheets
 screenshot "01-google-home.png"
 
+# 2) Search – force clean start
+log "opening search (clean Chrome start)"
 open_url "$SEARCH_URL"
-wait_for_page 7
+wait_for_page 9
 dismiss_chrome_sheets
 screenshot "02-search-results.png"
 
-log "attempting real organic click from Google SERP (handles AI Overview + new tabs)..."
+# Make sure DevTools is alive before trying the organic click
+if ! wait_for_devtools 25; then
+  log "DevTools not ready after search – one more Chrome restart"
+  open_url "$SEARCH_URL"
+  wait_for_page 10
+  wait_for_devtools 20 || true
+fi
+
+log "attempting real organic click from Google SERP..."
 if tap_search_result; then
-  wait_for_page 6
+  wait_for_page 7
   screenshot "03-organic-landed.png"
   sleep 3
   screenshot "04-organic-settled.png"
