@@ -246,6 +246,9 @@ settle_device() {
 # ONE single Python process: organic click + multi-page engagement
 # This eliminates the tab-loss problem between two processes.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ONE single Python process: organic click + smart multi-page engagement
+# ---------------------------------------------------------------------------
 do_organic_and_engage() {
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
     || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
@@ -260,9 +263,11 @@ import websocket
 HOST = os.environ["RESULT_HOST"].strip().lower()
 TARGET = os.environ["RESULT_TEXT"].strip().lower()
 ARTIFACTS = os.environ["ARTIFACTS"]
-NUM_PAGES = random.randint(2, 5)
-MIN_DWELL = 28
-MAX_DWELL = 70
+
+# 4–5 pages total (including the landing page)
+NUM_PAGES = random.randint(4, 5)
+MIN_DWELL = 35          # seconds
+MAX_DWELL = 85
 
 def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
@@ -288,7 +293,6 @@ def find_target_tab():
         pass
     return None
 
-# Wait for any tab
 tab = None
 for _ in range(40):
     tab = find_google_tab()
@@ -328,7 +332,6 @@ def cdp(method, **params):
                 ws.close()
             except: pass
             time.sleep(2)
-            # try to re-attach to target first, then google
             new_tab = find_target_tab() or find_google_tab()
             if not new_tab:
                 raise
@@ -349,7 +352,6 @@ cdp("Page.enable")
 cdp("Runtime.enable")
 cdp("Network.enable")
 
-# Optional: force exact query if Google shows correction
 def try_exact_query():
     clicked = js("""(() => {
       const links = [...document.querySelectorAll('a')];
@@ -368,17 +370,8 @@ def try_exact_query():
 
 try_exact_query()
 
-# Debug
-dbg = js("""(() => JSON.stringify({
-  url: location.href, title: document.title,
-  headings: [...document.querySelectorAll('h3,[role=heading]')]
-      .map(e => (e.innerText||'').trim()).filter(Boolean).slice(0,20)
-}))()""")
-with open(os.path.join(ARTIFACTS, "page-debug.json"), "w") as f:
-    f.write(dbg or "{}")
-d = json.loads(dbg or "{}")
-print("page title:", d.get("title"), flush=True)
-print("headings:", d.get("headings"), flush=True)
+# ---------- ORGANIC CLICK ----------
+print("=== ORGANIC CLICK PHASE ===", flush=True)
 
 FIND_JS = """(() => {
   const HOST = %s, TEXT = %s;
@@ -445,8 +438,6 @@ def is_target(url):
     u = (url or "").lower()
     return HOST in u and "google." not in u and "chrome-error" not in u
 
-# ---------- ORGANIC CLICK ----------
-print("=== ORGANIC CLICK PHASE ===", flush=True)
 success = False
 for attempt in range(40):
     info = json.loads(js(FIND_JS) or "{}")
@@ -455,7 +446,7 @@ for attempt in range(40):
     W = info.get("innerW", 400)
 
     if found and 70 < found["y"] < H - 70:
-        print(f"found <{found['tag']}> '{found['text']}' score={found.get('score')} at ({found['x']:.0f},{found['y']:.0f})", flush=True)
+        print(f"found <{found['tag']}> '{found['text']}' score={found.get('score')}", flush=True)
         cdp("Input.synthesizeTapGesture", x=found["x"], y=found["y"])
         print("real tap performed – waiting...", flush=True)
 
@@ -470,10 +461,9 @@ for attempt in range(40):
                     break
             except Exception:
                 pass
-            # also check other tabs
             t = find_target_tab()
             if t:
-                print(f"SUCCESS: target appeared in another tab → {t.get('url')}", flush=True)
+                print(f"SUCCESS: target in another tab → {t.get('url')}", flush=True)
                 try: ws.close()
                 except: pass
                 tab = t
@@ -486,10 +476,8 @@ for attempt in range(40):
             break
     else:
         if found:
-            print(f"found but off-center, scrolling...", flush=True)
             smooth_scroll(int(found["y"] - H/2), int(W/2), int(H*0.55))
         else:
-            print(f"not found yet (attempt {attempt})", flush=True)
             if info.get("scrollY", 0) >= info.get("maxY", 0) - 10 and attempt > 4:
                 break
             smooth_scroll(int(H*0.35), int(W/2), int(H*0.6))
@@ -498,16 +486,15 @@ if not success:
     print("FAILED: could not complete real organic click", flush=True)
     sys.exit(1)
 
-# Take screenshots of the landed page
+# Screenshots of landing
 subprocess.run(["adb", "exec-out", "screencap", "-p"],
                stdout=open(os.path.join(ARTIFACTS, "03-organic-landed.png"), "wb"), check=False)
 time.sleep(2)
 subprocess.run(["adb", "exec-out", "screencap", "-p"],
                stdout=open(os.path.join(ARTIFACTS, "04-organic-settled.png"), "wb"), check=False)
-print("organic screenshots saved", flush=True)
 
-# ---------- ENGAGEMENT (same process – no tab loss) ----------
-print("\n=== ENGAGEMENT PHASE ===", flush=True)
+# ---------- SMART ENGAGEMENT ----------
+print("\n=== ENGAGEMENT PHASE (blog posts + categories) ===", flush=True)
 print(f"will visit {NUM_PAGES} pages", flush=True)
 
 def page_dims():
@@ -529,34 +516,40 @@ def smooth_scroll_random(sec):
         elif curY < 40:
             direction = -1
         else:
-            direction = -1 if random.random() < 0.78 else 1
-        dist = random.randint(int(H*0.22), int(H*0.50))
-        speed = random.randint(260, 600)
-        x = int(W * random.uniform(0.32, 0.68))
-        y = int(H * random.uniform(0.42, 0.70))
+            direction = -1 if random.random() < 0.75 else 1
+        dist = random.randint(int(H*0.22), int(H*0.48))
+        speed = random.randint(280, 580)
+        x = int(W * random.uniform(0.30, 0.70))
+        y = int(H * random.uniform(0.40, 0.70))
         cdp("Input.synthesizeScrollGesture", x=x, y=y, yDistance=direction*dist, speed=speed, gestureSourceType="touch")
         count += 1
-        pause = random.uniform(1.5, 4.0)
+        pause = random.uniform(1.8, 4.5)
         remaining = end - time.time()
         if remaining <= 0: break
         time.sleep(min(pause, remaining))
     print(f"  performed {count} smooth scrolls", flush=True)
 
-def find_internal_links():
+def find_good_internal_links():
+    """Prefer real blog posts and category pages. Avoid about/contact/privacy."""
     raw = js("""(() => {
         const host = location.hostname.replace(/^www\\./,'').replace(/^m\\./,'');
         const vis = e => {
             const r = e.getBoundingClientRect(), st = getComputedStyle(e);
-            return r.width > 10 && r.height > 10 && st.visibility !== 'hidden'
-                   && st.display !== 'none' && r.top < window.innerHeight && r.bottom > 0;
+            return r.width > 12 && r.height > 12 && st.visibility !== 'hidden'
+                   && st.display !== 'none' && r.top < window.innerHeight + 200 && r.bottom > -100;
         };
+        const badPaths = ['/about', '/contact', '/privacy', '/terms', '/licensing',
+                          '/cookie', '/login', '/register', '/cart', '/checkout', '/account'];
         const isInternal = a => {
             try {
                 const u = new URL(a.href, location.href);
                 const h = u.hostname.replace(/^www\\./,'').replace(/^m\\./,'');
                 if (h !== host) return false;
                 if (u.hash && u.pathname === location.pathname) return false;
-                if (u.pathname === '/' || u.pathname === location.pathname) return false;
+                const path = u.pathname.toLowerCase();
+                for (const b of badPaths) {
+                    if (path.includes(b)) return false;
+                }
                 return true;
             } catch(e) { return false; }
         };
@@ -564,35 +557,72 @@ def find_internal_links():
             let s = 0;
             const t = (a.innerText || '').trim().toLowerCase();
             const href = a.href.toLowerCase();
-            if (a.querySelector('h1,h2,h3,h4,[role=heading]')) s += 4;
-            if (/\\/20[0-9]{2}\\//.test(href)) s += 2;
-            if (t.length > 15) s += 1;
+            const path = new URL(a.href, location.href).pathname.toLowerCase();
+
+            // Strong preference for blog posts
+            if (/\\/20[0-9]{2}\\//.test(href) || /\\/blog\\//.test(href) || /\\/post\\//.test(href)) s += 8;
+            if (a.querySelector('h1,h2,h3,h4,[role=heading]')) s += 5;
+            if (t.length > 25 && t.length < 120) s += 3;   // article titles
+            if (/\\/category\\//.test(href) || /\\/tag\\//.test(href)) s += 4;
+            if (path === '/' || path === '') s += 2;       // homepage is ok
+            if (t.includes('read more') || t.includes('continue')) s += 2;
+
+            // Penalty for very short or navigation text
+            if (t.length < 8) s -= 3;
+            if (['home','menu','search','share'].includes(t)) s -= 4;
+
             return s;
         };
-        const links = [...document.querySelectorAll('a[href]')].filter(a => isInternal(a) && vis(a));
+        const links = [...document.querySelectorAll('a[href]')]
+            .filter(a => isInternal(a) && vis(a));
         links.sort((x,y) => score(y) - score(x));
-        return JSON.stringify(links.slice(0, 15).map(a => {
+        return JSON.stringify(links.slice(0, 20).map(a => {
             const t = a.querySelector('h1,h2,h3,h4,[role=heading]') || a;
             const r = t.getBoundingClientRect();
-            return {text: (t.innerText||a.innerText||'').trim().slice(0,80),
-                    href: a.href, x: r.left+r.width/2, y: r.top+r.height/2, score: score(a)};
+            return {
+                text: (t.innerText || a.innerText || '').trim().slice(0, 90),
+                href: a.href,
+                x: r.left + r.width/2,
+                y: r.top + r.height/2,
+                score: score(a)
+            };
         }));
     })()""")
-    try: return json.loads(raw or "[]")
-    except: return []
+    try:
+        return json.loads(raw or "[]")
+    except:
+        return []
 
 visited = set()
 current = js("location.href") or ""
 print(f"starting engagement on: {current}", flush=True)
 
+# If we landed on About, first try to go to homepage or a good article
+if "/about" in current.lower() or "/contact" in current.lower():
+    print("Landed on About/Contact – trying to move to better content...", flush=True)
+    # Try clicking logo / home if available
+    home_clicked = js("""(() => {
+        const logo = document.querySelector('a[href="/"], a[href="https://gardengar.com/"], a[href="https://www.gardengar.com/"], .logo a, header a');
+        if (logo) { logo.click(); return true; }
+        return false;
+    })()""")
+    if home_clicked:
+        time.sleep(4)
+        print("clicked logo/home", flush=True)
+    else:
+        # fallback soft navigate to homepage (still counts as on-site engagement)
+        cdp("Page.navigate", url="https://gardengar.com/")
+        time.sleep(4)
+        print("navigated to homepage", flush=True)
+
 for page_num in range(1, NUM_PAGES + 1):
     print(f"\n===== PAGE {page_num}/{NUM_PAGES} =====", flush=True)
     dwell = random.randint(MIN_DWELL, MAX_DWELL)
-    print(f"  dwelling ~{dwell}s...", flush=True)
+    print(f"  dwelling ~{dwell}s with scrolls...", flush=True)
     smooth_scroll_random(dwell)
 
     try:
-        name = f"0{4+page_num}-page{page_num}.png"
+        name = f"0{4 + page_num}-page{page_num}.png"
         subprocess.run(["adb", "exec-out", "screencap", "-p"],
                        stdout=open(os.path.join(ARTIFACTS, name), "wb"), check=False)
         print(f"  screenshot {name}", flush=True)
@@ -602,32 +632,42 @@ for page_num in range(1, NUM_PAGES + 1):
     if page_num >= NUM_PAGES:
         break
 
-    links = find_internal_links()
-    candidates = [L for L in links if L["href"] not in visited]
+    links = find_good_internal_links()
+    # Only keep high-quality candidates
+    candidates = [L for L in links if L["href"] not in visited and L.get("score", 0) >= 3]
     if not candidates:
-        print("  no more internal links", flush=True)
+        candidates = [L for L in links if L["href"] not in visited]
+
+    if not candidates:
+        print("  no more good internal links found", flush=True)
         break
-    choice = random.choice(candidates[:6])
+
+    # Prefer highest score but still random among top ones
+    top = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:6]
+    choice = random.choice(top)
     visited.add(choice["href"])
-    print(f"  tapping '{choice['text'][:50]}' → {choice['href']}", flush=True)
+
+    print(f"  tapping '{choice['text'][:55]}' (score={choice.get('score')}) → {choice['href']}", flush=True)
     cdp("Input.synthesizeTapGesture", x=choice["x"], y=choice["y"])
-    time.sleep(4)
+    time.sleep(4.5)
+
     now = js("location.href") or ""
     if HOST not in now.lower():
-        # soft recovery only if we somehow left the site
+        print("  left site – recovering...", flush=True)
         cdp("Page.navigate", url=choice["href"])
-        time.sleep(3)
+        time.sleep(3.5)
+
     print(f"  now at: {js('location.href')}", flush=True)
 
 print("\n===== FINAL DWELL =====", flush=True)
-smooth_scroll_random(random.randint(18, 35))
+smooth_scroll_random(random.randint(20, 40))
 subprocess.run(["adb", "exec-out", "screencap", "-p"],
                stdout=open(os.path.join(ARTIFACTS, "09-final.png"), "wb"), check=False)
 
-print("browse finished")
-print("visited:", list(visited), flush=True)
+print("\nbrowse finished")
+print("visited pages:", list(visited), flush=True)
 ws.close()
-print("ALL DONE – organic + engagement completed in one process", flush=True)
+print("ALL DONE – organic + multi-page engagement completed", flush=True)
 PY
 }
 
