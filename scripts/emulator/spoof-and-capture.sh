@@ -475,12 +475,15 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# Multi-page engagement (2–5 pages)
+# Multi-page engagement (2–5 pages) – STRICT target-tab selection
 # ---------------------------------------------------------------------------
 browse_site() {
   python3 -m pip install -q websocket-client --break-system-packages >/dev/null 2>&1 \
     || python3 -m pip install -q websocket-client >/dev/null 2>&1 || true
   adb forward tcp:9222 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true
+
+  # Give Chrome a moment after the organic tab switch
+  sleep 3
 
   ARTIFACTS="$ARTIFACTS" RESULT_HOST="$RESULT_HOST" python3 - <<'PY'
 import json, os, sys, time, random, urllib.request
@@ -496,53 +499,79 @@ def get_tabs():
     with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=8) as r:
         return json.loads(r.read().decode())
 
-tab = None
-for _ in range(45):
-    try:
-        pages = [t for t in get_tabs() if t.get("type") == "page"]
-        pages.sort(key=lambda t: 0 if HOST in t.get("url", "").lower() else 1)
-        if pages:
-            tab = pages[0]
-            break
-    except Exception:
-        pass
-    time.sleep(1)
+def find_target_tab(max_attempts=30):
+    """Strictly find a tab that is already on the target host."""
+    for attempt in range(max_attempts):
+        try:
+            pages = [t for t in get_tabs() if t.get("type") == "page"]
+            # Prefer exact host match and exclude Google
+            candidates = []
+            for t in pages:
+                url = t.get("url", "").lower()
+                if HOST in url and "google." not in url and "chrome-error" not in url:
+                    candidates.append(t)
+            if candidates:
+                # Prefer the one that looks most like the homepage or main site
+                candidates.sort(key=lambda t: 0 if t.get("url", "").rstrip("/").endswith(HOST) else 1)
+                return candidates[0]
+        except Exception as e:
+            print(f"tab lookup error: {e}", flush=True)
+        time.sleep(1.2)
+    return None
 
+print("looking for target tab (gardengar.com)...", flush=True)
+tab = find_target_tab()
 if not tab:
-    print("DevTools tab not reachable for browse", flush=True)
+    print("ERROR: could not find any tab on", HOST, flush=True)
+    # Debug: show all open tabs
+    try:
+        for t in get_tabs():
+            if t.get("type") == "page":
+                print(f"  open tab: {t.get('url')}", flush=True)
+    except: pass
     sys.exit(2)
 
 print("browse attached to:", tab.get("url"), flush=True)
 
 ws = websocket.create_connection(
     tab["webSocketDebuggerUrl"],
-    timeout=90, suppress_origin=True,
-    ping_interval=15, ping_timeout=10
+    timeout=120,
+    suppress_origin=True,
+    ping_interval=12,
+    ping_timeout=8
 )
 
 _id = 0
 def cdp(method, **params):
-    global _id, ws
-    for attempt in range(3):
+    global _id, ws, tab
+    for attempt in range(4):
         try:
             _id += 1
             ws.send(json.dumps({"id": _id, "method": method, "params": params}))
-            deadline = time.time() + 20
+            deadline = time.time() + 25
             while time.time() < deadline:
                 msg = json.loads(ws.recv())
                 if msg.get("id") == _id:
                     return msg.get("result", {})
         except Exception as e:
             print(f"CDP error ({attempt+1}): {e}", flush=True)
-            try: ws.close()
+            try:
+                ws.close()
             except: pass
-            time.sleep(1.5)
-            tabs = [t for t in get_tabs() if t.get("type") == "page"]
-            if not tabs: raise
-            tab = tabs[0]
+            time.sleep(2)
+            # Re-find the target tab and reconnect
+            new_tab = find_target_tab(max_attempts=8)
+            if not new_tab:
+                print("lost target tab during reconnect", flush=True)
+                raise
+            tab = new_tab
+            print(f"reconnected to: {tab.get('url')}", flush=True)
             ws = websocket.create_connection(
-                tab["webSocketDebuggerUrl"], timeout=90,
-                suppress_origin=True, ping_interval=15, ping_timeout=10
+                tab["webSocketDebuggerUrl"],
+                timeout=120,
+                suppress_origin=True,
+                ping_interval=12,
+                ping_timeout=8
             )
     raise RuntimeError("CDP failed after retries")
 
@@ -565,25 +594,32 @@ def smooth_scroll_random(total_time_sec):
     scroll_count = 0
     while time.time() < end:
         d = page_dims()
-        H, W = d.get("H", 800), d.get("W", 400)
-        maxY, curY = d.get("maxY", 0), d.get("scrollY", 0)
+        H = d.get("H", 800)
+        W = d.get("W", 400)
+        maxY = d.get("maxY", 0)
+        curY = d.get("scrollY", 0)
+
         if curY >= maxY - 30 and maxY > 0:
             direction = 1
         elif curY < 40:
             direction = -1
         else:
             direction = -1 if random.random() < 0.78 else 1
+
         dist = random.randint(int(H * 0.22), int(H * 0.50))
         speed = random.randint(260, 600)
         x = int(W * random.uniform(0.32, 0.68))
         y = int(H * random.uniform(0.42, 0.70))
+
         cdp("Input.synthesizeScrollGesture",
             x=x, y=y, yDistance=direction * dist,
             speed=speed, gestureSourceType="touch")
         scroll_count += 1
+
         pause = random.uniform(1.5, 4.0)
         remaining = end - time.time()
-        if remaining <= 0: break
+        if remaining <= 0:
+            break
         time.sleep(min(pause, remaining))
     print(f"  performed {scroll_count} smooth scrolls over ~{total_time_sec}s", flush=True)
 
@@ -631,8 +667,10 @@ def find_internal_links():
             };
         }));
     })()""")
-    try: return json.loads(raw or "[]")
-    except: return []
+    try:
+        return json.loads(raw or "[]")
+    except Exception:
+        return []
 
 def tap_link(link):
     x, y = link["x"], link["y"]
@@ -656,15 +694,20 @@ def tap_link(link):
     if now.rstrip("/") == link["href"].rstrip("/"):
         print(f"  navigated OK → {now}", flush=True)
         return True
+    # Soft fallback only for internal pages (already on-site)
     print(f"  soft navigate to {link['href']}", flush=True)
     cdp("Page.navigate", url=link["href"])
     time.sleep(3.5)
     return True
 
+# ---------- main engagement ----------
 visited = set()
 current = js("location.href") or ""
 print(f"starting engagement on: {current}", flush=True)
 print(f"will visit {NUM_PAGES} pages total", flush=True)
+
+if HOST not in current.lower():
+    print("WARNING: attached tab is not on target host!", flush=True)
 
 for page_num in range(1, NUM_PAGES + 1):
     print(f"\n===== PAGE {page_num}/{NUM_PAGES} =====", flush=True)
